@@ -35,7 +35,7 @@ OM_FILENAME_PATTERNS = {
 # Fuer welche Variablen die echten Werte zusaetzlich als DVAL-Chunk
 # ins WebP eingebettet werden sollen (kein separates File noetig).
 # ------------------------------
-EMBED_DATA_VARS = {"t2m", "wind", "tp", "cape_ml"}
+EMBED_DATA_VARS = {"t2m", "wind"}
 
 # ------------------------------
 # Temperatur-Farben
