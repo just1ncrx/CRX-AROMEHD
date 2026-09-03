@@ -93,7 +93,7 @@ jobs:
       - name: Generate PNGs for ${{ matrix.variable }}
         run: |
           mkdir -p aromehd/${{ matrix.variable }}
-          input_dir="data/${{ matrix.variable }}"
+          input_dir="data/parameter"
           script="scripts/generate_pngs.py"
           python "$script" \
             "$input_dir" \
