@@ -1,5 +1,7 @@
 import sys
 import os
+import re
+import gc
 import struct
 import zlib
 import datetime as dt
@@ -16,20 +18,26 @@ from omfiles import OmFileReader
 # ------------------------------
 # Eingabe-/Ausgabe
 # ------------------------------
-data_dir = sys.argv[1]        # z.B. "output"
+data_dir = sys.argv[1]        # z.B. "data/parameter"
 output_dir = sys.argv[2]      # z.B. "output/maps"
 var_type = sys.argv[3]        # 't2m', 'wind', ...
 os.makedirs(output_dir, exist_ok=True)
 
 # ------------------------------
-# var_type -> Substring, der im Dateinamen der zugehoerigen .om Datei steht
+# var_type -> Name des Kindes (Variable) INNERHALB jeder .om Datei.
+# Im data_spatial-Layout enthaelt JEDE Datei ALLE Variablen fuer genau
+# einen Zeitschritt (root ist eine Gruppe, kein Array). Der Dateiname
+# selbst ist der Zeitstempel, z.B. "2026-09-03T1900.om".
 # ------------------------------
-OM_FILENAME_PATTERNS = {
+OM_CHILD_NAMES = {
     "t2m": "temperature_2m",
     "wind": "wind_gusts_10m",
     "tp": "precipitation",
     "cape_ml": "cape"
 }
+
+# Regex fuer den Zeitstempel im Dateinamen: YYYY-MM-DDTHHMM.om
+FILENAME_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{4})")
 
 # ------------------------------
 # Fuer welche Variablen die echten Werte zusaetzlich als DVAL-Chunk
@@ -126,9 +134,10 @@ GLOBAL_LAT_MAX, GLOBAL_LON_MAX = 55.4, 16.0
 # Per check_lat_order.py verifiziert: Zeile 0 = ~-52°C (Suedpol) -> aufsteigend gespeichert.
 LAT_STORED_DESCENDING = False
 
-# Dimensionsreihenfolge im om-Array. Bestaetigt: shape=(721,1440,85), Zeit
-# ist die LETZTE Dimension (siehe auch 'coordinates'-Kind: "lat lon time").
-DIM_ORDER = ("lat", "lon", "time")
+# Dimensionsreihenfolge der Variablen-Arrays im data_spatial-Layout:
+# JEDE Datei ist EIN Zeitschritt, jede Variable ist ein 2D-Array (lat, lon)
+# OHNE eigene Zeitachse.
+DIM_ORDER = ("lat", "lon")
 
 # ------------------------------
 # Bounding Box (wie im GRIB2-Skript)
@@ -303,23 +312,17 @@ def crop_lat_lon_arrays(row_start, row_end, col_start, col_end, lat_res, lon_res
     return lat_crop, lon_crop
 
 
-def load_valid_times(root, ntime, om_path):
-    """Liest die echten (nicht-gleichmaessigen) Zeitschritte direkt aus dem
-    'time'-Kind der om-Datei (Unix-Timestamps in Sekunden, UTC)."""
-    try:
-        time_child = root.get_child_by_name("time")
-    except Exception as e:
+def parse_valid_time_from_filename(filename):
+    """Der Dateiname im data_spatial-Layout IST der Zeitstempel, z.B.
+    '2026-09-03T1900.om' -> 2026-09-03 19:00 UTC. Jede Datei enthaelt
+    genau diesen einen Zeitschritt fuer alle Variablen."""
+    match = FILENAME_TIME_RE.search(filename)
+    if not match:
         raise ValueError(
-            f"{om_path}: kein 'time'-Kind gefunden - kann Zeitstempel nicht bestimmen ({e})"
+            f"{filename}: Zeitstempel nicht im Dateinamen gefunden "
+            f"(erwartet Format YYYY-MM-DDTHHMM.om)"
         )
-
-    if not time_child.is_array or time_child.shape[0] != ntime:
-        raise ValueError(
-            f"{om_path}: 'time'-Kind passt nicht (shape={time_child.shape}, erwartet ntime={ntime})"
-        )
-
-    raw = time_child.read_array((slice(0, ntime),))
-    return [dt.datetime.fromtimestamp(int(t), tz=dt.timezone.utc) for t in raw]
+    return dt.datetime.strptime(match.group(1), "%Y-%m-%dT%H%M").replace(tzinfo=dt.timezone.utc)
 
 
 # ------------------------------
@@ -332,77 +335,103 @@ if var_type not in COLORMAPS:
 cmap, norm = COLORMAPS[var_type]
 convert = UNIT_CONVERT.get(var_type, lambda v: v)
 
-pattern = OM_FILENAME_PATTERNS.get(var_type)
-if pattern is None:
-    print(f"var_type '{var_type}' hat noch kein Dateinamen-Muster in OM_FILENAME_PATTERNS")
+child_name = OM_CHILD_NAMES.get(var_type)
+if child_name is None:
+    print(f"var_type '{var_type}' hat noch kein Kind-Name-Mapping in OM_CHILD_NAMES")
     sys.exit(1)
 
 # ------------------------------
-# Dateien durchgehen
+# Dateien durchgehen - JEDE .om Datei ist ein eigener Zeitschritt und
+# enthaelt ALLE Variablen als Kinder, daher KEIN Filtern nach
+# Variablenname im Dateinamen mehr (wie es beim alten data_run-Layout
+# noetig war).
 # ------------------------------
-all_files_global = sorted(f for f in os.listdir(data_dir) if f.endswith(".om"))
-matching_files = [f for f in all_files_global if pattern.lower() in f.lower()]
-
-if not matching_files:
-    print(f"Keine .om Datei in {data_dir} gefunden, die zu '{pattern}' passt "
-          f"(gefunden: {all_files_global})")
-
-for filename in matching_files:
+def process_file(filename):
+    """Verarbeitet EINE .om Datei. In eine eigene Funktion ausgelagert,
+    damit alle lokalen Arrays (data, render_data_merc, ...) garantiert
+    aus dem Scope fallen, sobald der Aufruf zurueckkehrt - das haelt den
+    Speicherverbrauch ueber viele Dateien hinweg stabil, statt dass sich
+    Referenzen im globalen Namespace der for-Schleife ansammeln."""
     om_path = os.path.join(data_dir, filename)
 
-    with OmFileReader(om_path) as root:
-        # root ist gleichzeitig das Datenarray UND hat Metadaten-Kinder
-        # (time, crs_wkt, unit, forecast_reference_time, coordinates, created_at).
-        if not root.is_array:
-            print(f"{om_path}: root ist kein Array (is_group={root.is_group}) - überspringe")
-            continue
+    try:
+        valid_time_utc = parse_valid_time_from_filename(filename)
+    except ValueError as e:
+        print(f"{e} - überspringe")
+        return
 
-        nlat, nlon, ntime = root.shape  # bestaetigt: (lat, lon, time)
+    with OmFileReader(om_path) as root:
+        if not root.is_group:
+            print(f"{om_path}: root ist keine Gruppe (is_array={root.is_array}) - überspringe")
+            return
+
+        try:
+            var_node = root.get_child_by_name(child_name)
+        except Exception as e:
+            print(f"{om_path}: Kind '{child_name}' nicht gefunden - überspringe ({e})")
+            return
+
+        if not var_node.is_array:
+            print(f"{om_path}: '{child_name}' ist kein Array - überspringe")
+            return
+
+        nlat, nlon = var_node.shape  # 2D, kein Zeitindex mehr - ein Zeitschritt pro Datei
 
         row_start, row_end, col_start, col_end, lat_res, lon_res = compute_crop_indices(nlat, nlon)
         lat_crop, lon_crop = crop_lat_lon_arrays(row_start, row_end, col_start, col_end, lat_res, lon_res, nlat)
 
-        # Ganzen Europa-Ausschnitt fuer ALLE Zeitschritte auf einmal lesen -
-        # passt zum Chunk-Layout (Zeitachse wird ohnehin komplett pro Chunk
-        # gespeichert), spart also viele einzelne read_array-Aufrufe.
-        data_all = root.read_array((
+        data_raw = var_node.read_array((
             slice(row_start, row_end + 1),
             slice(col_start, col_end + 1),
-            slice(0, ntime),
-        ))  # shape: (nrows, ncols, ntime)
+        ))  # shape: (nrows, ncols)
 
-        valid_times_utc = load_valid_times(root, ntime, om_path)
+        # float32 statt float64 halbiert den Speicherbedarf fuer diese
+        # (in der Schleife immer wieder neu angelegten) Arrays.
+        data = convert(np.asarray(data_raw, dtype=np.float32))
+        del data_raw
 
-        for t_idx in range(ntime):
-            data = convert(np.asarray(data_all[:, :, t_idx], dtype=np.float64))
+        if LAT_STORED_DESCENDING:
+            data = data[::-1, :]  # Zeile 0 -> Sueden, wie warp_equirect erwartet
+            lat_asc = lat_crop[::-1]
+        else:
+            lat_asc = lat_crop
 
-            if LAT_STORED_DESCENDING:
-                data = data[::-1, :]  # Zeile 0 -> Sueden, wie warp_equirect erwartet
-                lat_asc = lat_crop[::-1]
-            else:
-                lat_asc = lat_crop
+        # ------------------------------
+        # Nach EPSG:3857 (Web Mercator) umprojizieren
+        # ------------------------------
+        render_data_merc = warp_equirect_to_webmercator(data, lon_crop, lat_asc, extent, method="linear")
+        del data
 
-            # ------------------------------
-            # Nach EPSG:3857 (Web Mercator) umprojizieren
-            # ------------------------------
-            render_data_merc = warp_equirect_to_webmercator(data, lon_crop, lat_asc, extent, method="linear")
+        # ------------------------------
+        # Transparentes WebP speichern
+        # ------------------------------
+        outname = f"{var_type}_{valid_time_utc.astimezone(ZoneInfo('Europe/Berlin')):%Y%m%d_%H%M}.webp"
+        out_path = os.path.join(output_dir, outname)
+        save_transparent_webp(render_data_merc, cmap, norm, out_path)
 
-            # ------------------------------
-            # Transparentes WebP speichern
-            # ------------------------------
-            outname = f"{var_type}_{valid_times_utc[t_idx].astimezone(ZoneInfo('Europe/Berlin')):%Y%m%d_%H%M}.webp"
-            out_path = os.path.join(output_dir, outname)
-            save_transparent_webp(render_data_merc, cmap, norm, out_path)
+        # Fuer t2m/wind zusaetzlich die echten physikalischen Werte
+        # (°C bzw. km/h, nicht die Farben) als privaten RIFF-Chunk
+        # direkt ins WebP einbetten - row0 = Norden, damit der Chunk
+        # 1:1 zur Bildorientierung passt (das Bild wird in
+        # save_transparent_webp beim Speichern gespiegelt,
+        # render_data_merc selbst hat row0 = Sueden).
+        if var_type in EMBED_DATA_VARS:
+            germany_data = crop_to_germany(render_data_merc)          # row0 = Süden
+            quantum = QUANTUM_STEP.get(var_type, 0.1)
+            embed_data_chunk(out_path, germany_data[::-1], GERMANY_CROP_EXTENT_3857, quantum)  # row0 = Norden
 
-            # Fuer t2m/wind zusaetzlich die echten physikalischen Werte
-            # (°C bzw. km/h, nicht die Farben) als privaten RIFF-Chunk
-            # direkt ins WebP einbetten - row0 = Norden, damit der Chunk
-            # 1:1 zur Bildorientierung passt (das Bild wird in
-            # save_transparent_webp beim Speichern gespiegelt,
-            # render_data_merc selbst hat row0 = Sueden).
-            if var_type in EMBED_DATA_VARS:
-                germany_data = crop_to_germany(render_data_merc)          # row0 = Süden
-                quantum = QUANTUM_STEP.get(var_type, 0.1)
-                embed_data_chunk(out_path, germany_data[::-1], GERMANY_CROP_EXTENT_3857, quantum)  # row0 = Norden
+        print(f"{filename} -> {outname}")
 
-            print(f"{filename} t_idx={t_idx} -> {outname}")
+
+all_files = sorted(f for f in os.listdir(data_dir) if f.endswith(".om"))
+
+if not all_files:
+    print(f"Keine .om Dateien in {data_dir} gefunden")
+
+for i, filename in enumerate(all_files):
+    process_file(filename)
+    # Alle 10 Dateien den Garbage Collector explizit anstossen, damit sich
+    # ueber viele Iterationen kein Speicher unnoetig anstaut (relevant bei
+    # sehr vielen Zeitschritten pro Lauf, z.B. beim 15min-Modell).
+    if i % 10 == 9:
+        gc.collect()
