@@ -36,16 +36,7 @@ jobs:
         id: set_run_date
         run: |
           HOUR=$(date -u +%H)
-          case $HOUR in
-            02|03) RUN=00 ;;
-            05|06|07) RUN=03 ;;
-            11|12)    RUN=06 ;;
-            13|14)    RUN=09 ;;
-            15|16|17) RUN=12 ;;
-            19|20) RUN=15 ;;
-            23|00) RUN=18 ;;
-            01) RUN=21 ;;
-          esac
+          RUN=$HOUR
           YEAR=$(date -u +%Y)
           MONTH=$(date -u +%m)
           DAY=$(date -u +%d)
