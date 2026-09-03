@@ -1,0 +1,178 @@
+name: Fetch AROME-HD OM and Generate PNGs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch_and_generate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.set_run_date.outputs.run }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.AROMEHD_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+
+      - name: Cache Python packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set RUN and DATE
+        id: set_run_date
+        run: |
+          HOUR=$(date -u +%H)
+          case $HOUR in
+            02|03) RUN=00 ;;
+            05|06|07) RUN=03 ;;
+            11|12)    RUN=06 ;;
+            13|14)    RUN=09 ;;
+            15|16|17) RUN=12 ;;
+            19|20) RUN=15 ;;
+            23|00) RUN=18 ;;
+            01) RUN=21 ;;
+          esac
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%m)
+          DAY=$(date -u +%d)
+          DATE=$(date -u +%Y%m%d)
+          # set env variables
+          echo "RUN=$RUN" >> $GITHUB_ENV
+          echo "YEAR=$YEAR" >> $GITHUB_ENV
+          echo "MONTH=$MONTH" >> $GITHUB_ENV
+          echo "DAY=$DAY" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          # set step output for job output
+          echo "run=$RUN" >> $GITHUB_OUTPUT
+
+      - name: Download OM files from Open-Meteo S3 (t2m, wind, tp)
+        run: |
+          mkdir -p data/t2m data/wind data/tp data/cape_ml
+
+          BASE_URL="https://openmeteo.s3.amazonaws.com/data_run/meteofrance_arome_france_hd/${YEAR}/${MONTH}/${DAY}/${RUN}00Z"
+
+          echo "Lade von: $BASE_URL"
+
+          curl -fSL "${BASE_URL}/temperature_2m.om" -o "data/t2m/temperature_2m.om"
+          curl -fSL "${BASE_URL}/wind_gusts_10m.om" -o "data/wind/wind_gusts_10m.om"
+          curl -fSL "${BASE_URL}/precipitation.om"  -o "data/tp/precipitation.om"
+          curl -fSL "${BASE_URL}/cape.om"  -o "data/cape_ml/cape.om"
+
+          
+      - name: Upload data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: om-file
+          path: data/
+
+      - name: Delete data files (local cleanup)
+        run: rm -rf data/
+
+
+  generate_pngs:
+    runs-on: ubuntu-latest
+    needs: fetch_and_generate
+    strategy:
+      matrix:
+        variable: [t2m, wind, tp, cape_ml]
+      max-parallel: 4
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download GRIB2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: om-file
+          path: data/
+
+      - name: Generate PNGs for ${{ matrix.variable }}
+        run: |
+          mkdir -p aromehd/${{ matrix.variable }}
+          input_dir="data/${{ matrix.variable }}"
+          script="scripts/generate_pngs.py"
+          python "$script" \
+            "$input_dir" \
+            aromehd/${{ matrix.variable }} \
+            ${{ matrix.variable }}
+
+
+      - name: Upload PNGs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aromehd-${{ matrix.variable }}
+          path: aromehd/${{ matrix.variable }}
+
+  deploy_to_r2:
+    runs-on: ubuntu-latest
+    needs: [fetch_and_generate, generate_pngs]
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Download all PNGs artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aromehd-*
+          path: aromehd_raw
+
+      - name: Merge PNG folders into one structure
+        run: |
+          mkdir -p aromehd/${{ needs.fetch_and_generate.outputs.run }}
+          for d in aromehd_raw/*; do
+            if [ -d "$d" ]; then
+              varname=$(basename "$d" | sed 's/^aromehd-//')  # entfernt "aromehd-" Prefix
+              mkdir -p aromehd/${{ needs.fetch_and_generate.outputs.run }}/"$varname"
+              cp -r "$d"/* aromehd/${{ needs.fetch_and_generate.outputs.run }}/"$varname"/ || true
+            fi
+          done
+
+      - name: Generate Metadata
+        run: |
+          python scripts/generate_metadata.py aromehd/${{ needs.fetch_and_generate.outputs.run }} ${{ needs.fetch_and_generate.outputs.run }} ${{ env.DATE }}
+
+      - name: Clean old runs on R2 except current
+        run: |
+          for run_folder in $(aws s3 ls s3://${{ secrets.R2_BUCKET }}/aromehd/ --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com | awk '{print $2}' | sed 's#/##'); do
+            if [ "$run_folder" != "${{ needs.fetch_and_generate.outputs.run }}/" ]; then
+              aws s3 rm s3://${{ secrets.R2_BUCKET }}/aromehd/$run_folder --recursive --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+            fi
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Upload current run and metadata.json to R2
+        run: |
+          # Upload run folder
+          aws s3 sync ./aromehd/${{ needs.fetch_and_generate.outputs.run }}/ s3://${{ secrets.R2_BUCKET }}/aromehd/${{ needs.fetch_and_generate.outputs.run }}/ \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+          # Upload metadata.json outside run folder
+          aws s3 cp ./aromehd/metadata.json s3://${{ secrets.R2_BUCKET }}/aromehd/metadata.json \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
