@@ -6,3 +6,9 @@ numpy
 scipy
 matplotlib
 pillow
+
+# fuer den Download 
+requests
+
+# fuer ZoneInfo('Europe/Berlin') 
+tzdata
