@@ -35,7 +35,7 @@ jobs:
       - name: Set RUN and DATE
         id: set_run_date
         run: |
-          HOUR="19"
+          HOUR=$(date -u +%H)
           RUN=$HOUR
           YEAR=$(date -u +%Y)
           MONTH=$(date -u +%m)
