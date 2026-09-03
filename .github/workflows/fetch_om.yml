@@ -35,7 +35,7 @@ jobs:
       - name: Set RUN and DATE
         id: set_run_date
         run: |
-          HOUR=$(date -u +%H)
+          HOUR="19"
           RUN=$HOUR
           YEAR=$(date -u +%Y)
           MONTH=$(date -u +%m)
@@ -52,7 +52,7 @@ jobs:
 
       - name: Download OM files from Open-Meteo S3 (t2m, wind, tp)
         run: |
-          python download_om.py
+          python scripts/download_om.py
 
           
       - name: Upload data as artifact
