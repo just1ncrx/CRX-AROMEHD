@@ -1,0 +1,8 @@
+# Open-Meteo .om Dateiformat
+omfiles
+
+# Bildverarbeitung / Reprojektion
+numpy
+scipy
+matplotlib
+pillow
