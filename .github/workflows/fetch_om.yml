@@ -61,16 +61,7 @@ jobs:
 
       - name: Download OM files from Open-Meteo S3 (t2m, wind, tp)
         run: |
-          mkdir -p data/t2m data/wind data/tp data/cape_ml
-
-          BASE_URL="https://openmeteo.s3.amazonaws.com/data_run/meteofrance_arome_france_hd/${YEAR}/${MONTH}/${DAY}/${RUN}00Z"
-
-          echo "Lade von: $BASE_URL"
-
-          curl -fSL "${BASE_URL}/temperature_2m.om" -o "data/t2m/temperature_2m.om"
-          curl -fSL "${BASE_URL}/wind_gusts_10m.om" -o "data/wind/wind_gusts_10m.om"
-          curl -fSL "${BASE_URL}/precipitation.om"  -o "data/tp/precipitation.om"
-          curl -fSL "${BASE_URL}/cape.om"  -o "data/cape_ml/cape.om"
+          python download_om.py
 
           
       - name: Upload data as artifact
