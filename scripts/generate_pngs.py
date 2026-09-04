@@ -20,20 +20,28 @@ from omfiles import OmFileReader
 # ------------------------------
 data_dir = sys.argv[1]        # z.B. "data/parameter"
 output_dir = sys.argv[2]      # z.B. "output/maps"
-var_type = sys.argv[3]        # 't2m', 'wind', ...
+var_type = sys.argv[3]        # 't2m', 'wind', 'ww', ...
 os.makedirs(output_dir, exist_ok=True)
+
+# ------------------------------
+# Zeitschrittlaenge des Modells in Sekunden. Anpassen falls sich das
+# je nach Modell/Layout unterscheidet (z.B. 900 fuer 15min-Modell).
+# ------------------------------
+DT_SECONDS = 900
 
 # ------------------------------
 # var_type -> Name des Kindes (Variable) INNERHALB jeder .om Datei.
 # Im data_spatial-Layout enthaelt JEDE Datei ALLE Variablen fuer genau
 # einen Zeitschritt (root ist eine Gruppe, kein Array). Der Dateiname
 # selbst ist der Zeitstempel, z.B. "2026-09-03T1900.om".
+# "ww" wird separat behandelt (braucht zwei Kinder), steht deshalb NICHT
+# hier drin.
 # ------------------------------
 OM_CHILD_NAMES = {
     "t2m": "temperature_2m",
     "wind": "wind_gusts_10m",
     "tp": "precipitation",
-    "cape_ml": "cape"
+    "cape_ml": "cape",
 }
 
 # Regex fuer den Zeitstempel im Dateinamen: YYYY-MM-DDTHHMM.om
@@ -101,11 +109,24 @@ cape_colors = ListedColormap([
 ])
 cape_norm = mcolors.BoundaryNorm(cape_bounds, cape_colors.N)
 
+# ------------------------------
+# ww-Farben (nur Regen/Schneeregen/Schnee, Rest = 0 = grau)
+# ------------------------------
+ww_colors_base = {
+    0:  "#696969",   # alles Sonstige / kein Niederschlag
+    51: "#C2FF9A",   # Nieselregen
+    56: "#FFA500", 57: "#C06A00",   # Schneeregen
+    61: "#00FF00", 63: "#00C300", 65: "#009700",   # Regen
+    71: "#ADD8E6", 73: "#6495ED", 75: "#00008B",   # Schnee
+}
+
+# var_type -> (cmap, norm). "ww" ist absichtlich NICHT hier drin, weil es
+# den eigenen Lookup-Pfad ww_to_rgba() statt cmap/norm nutzt.
 COLORMAPS = {
     "t2m": (t2m_colors, t2m_norm),
     "wind": (wind_colors, wind_norm),
     "tp": (prec_colors, prec_norm),
-    "cape_ml": (cape_colors, cape_norm)
+    "cape_ml": (cape_colors, cape_norm),
 }
 
 # Umrechnung Rohwert -> Anzeige-Einheit, je Variable
@@ -326,19 +347,97 @@ def parse_valid_time_from_filename(filename):
 
 
 # ------------------------------
-# Farb-/Konvertierungs-Auswahl fuer den angeforderten var_type
+# ww-Berechnung (Regen/Schneeregen/Schnee aus precip + snowfall_water_equivalent)
 # ------------------------------
-if var_type not in COLORMAPS:
+def calculate_ww(precip, snow_we, dt_seconds):
+    """
+    precip:  mm/Zeitschritt (Gesamt, Regen+Schnee als Wasseräquivalent)
+    snow_we: mm WE/Zeitschritt (nur Schneeanteil)
+    dt_seconds: Zeitschrittlänge des Modells in Sekunden
+
+    Rückgabe: float-Array mit Codes 0, 56/57, 61/63/65, 71/73/75, oder
+    NaN dort, wo precip/snow_we selbst NaN war (= außerhalb des
+    AROME-Modellgebiets, nicht "kein Niederschlag"!).
+    """
+    dt_h = dt_seconds / 900.0
+
+    # Wo mindestens einer der beiden Eingabewerte fehlt (außerhalb des
+    # Modellgebiets) -> merken und am Ende NaN reinschreiben.
+    invalid = ~np.isfinite(precip) | ~np.isfinite(snow_we)
+
+    # Fuer die Vergleiche unten duerfen keine NaN mehr durch, sonst wuerden
+    # alle Bedingungen False bleiben und der Default-Code 0 (= "kein
+    # Niederschlag", opak grau) faelschlich stehen bleiben. Wird gleich
+    # durch die invalid-Maske wieder ueberschrieben.
+    precip_safe = np.where(invalid, 0.0, precip)
+    snow_safe = np.where(invalid, 0.0, snow_we)
+
+    rain_mm = np.clip(precip_safe - snow_safe, 0, None)   # reiner Regenanteil
+    snow_cm = snow_safe * 0.7                              # mm(WE) -> cm grob
+
+    rain_rate = rain_mm / dt_h   # mm/h
+    snow_rate = snow_cm / dt_h   # cm/h
+
+    has_precip = (precip_safe / dt_h) > 0.01
+    is_snow  = has_precip & (snow_rate > 0) & (rain_rate <= 0.05)
+    is_mixed = has_precip & (snow_rate > 0) & (rain_rate  > 0.05)
+    is_rain  = has_precip & (rain_rate  > 0) & ~is_mixed
+
+    code = np.zeros(precip.shape, dtype=np.float32)  # Default: 0
+
+    # Schneefall-Intensität
+    code = np.where(is_snow & (snow_rate < 0.2), 71, code)
+    code = np.where(is_snow & (snow_rate >= 0.2) & (snow_rate < 0.8), 73, code)
+    code = np.where(is_snow & (snow_rate >= 0.8), 75, code)
+
+    # Schneeregen (eigene Definition, nicht offizielles WMO 56/57)
+    code = np.where(is_mixed & (rain_rate < 2.5), 56, code)
+    code = np.where(is_mixed & (rain_rate >= 2.5), 57, code)
+
+    # Niesel-/Regen-Intensität
+    code = np.where(is_rain & (rain_rate < 0.2), 51, code)
+    code = np.where(is_rain & (rain_rate >= 0.2) & (rain_rate < 2.5), 61, code)
+    code = np.where(is_rain & (rain_rate >= 2.5) & (rain_rate < 7.6), 63, code)
+    code = np.where(is_rain & (rain_rate >= 7.6), 65, code)
+
+    # Ganz zum Schluss: außerhalb des Modellgebiets -> NaN statt Code 0,
+    # damit ww_to_rgba() das korrekt transparent zeichnet.
+    code[invalid] = np.nan
+
+    return code
+
+
+def ww_to_rgba(code_array, colors_hex):
+    lut_max = max(colors_hex) + 1
+    table = np.zeros((lut_max, 4), dtype=np.uint8)
+    for k, v in colors_hex.items():
+        table[k] = tuple(int(v[i:i + 2], 16) for i in (1, 3, 5)) + (255,)
+
+    valid = np.isfinite(code_array)
+    idx = np.clip(np.where(valid, code_array, 0).astype(np.int32), 0, lut_max - 1)
+    rgba = table[idx]
+    rgba[~valid, 3] = 0
+    return rgba
+
+
+# ------------------------------
+# Farb-/Konvertierungs-Auswahl fuer den angeforderten var_type
+# "ww" ist ein Sonderfall: kein Eintrag in COLORMAPS/OM_CHILD_NAMES,
+# weil es zwei Kinder liest und einen eigenen Rendering-Pfad hat.
+# ------------------------------
+if var_type != "wwhd" and var_type not in COLORMAPS:
     print(f"Unbekannter var_type {var_type}")
     sys.exit(1)
 
-cmap, norm = COLORMAPS[var_type]
-convert = UNIT_CONVERT.get(var_type, lambda v: v)
+if var_type != "wwhd":
+    cmap, norm = COLORMAPS[var_type]
+    convert = UNIT_CONVERT.get(var_type, lambda v: v)
 
-child_name = OM_CHILD_NAMES.get(var_type)
-if child_name is None:
-    print(f"var_type '{var_type}' hat noch kein Kind-Name-Mapping in OM_CHILD_NAMES")
-    sys.exit(1)
+    child_name = OM_CHILD_NAMES.get(var_type)
+    if child_name is None:
+        print(f"var_type '{var_type}' hat noch kein Kind-Name-Mapping in OM_CHILD_NAMES")
+        sys.exit(1)
+
 
 # ------------------------------
 # Dateien durchgehen - JEDE .om Datei ist ein eigener Zeitschritt und
@@ -365,6 +464,53 @@ def process_file(filename):
             print(f"{om_path}: root ist keine Gruppe (is_array={root.is_array}) - überspringe")
             return
 
+        # ------------------------------
+        # Sonderfall ww: braucht zwei Kinder, eigener Rendering-Pfad.
+        # Alles innerhalb des "with"-Blocks, damit root/get_child_by_name
+        # noch gueltig ist.
+        # ------------------------------
+        if var_type == "wwhd":
+            try:
+                precip_node = root.get_child_by_name("precipitation")
+                snow_node = root.get_child_by_name("snowfall_water_equivalent")
+            except Exception as e:
+                print(f"{om_path}: Kind nicht gefunden - überspringe ({e})")
+                return
+
+            nlat, nlon = precip_node.shape
+
+            row_start, row_end, col_start, col_end, lat_res, lon_res = compute_crop_indices(nlat, nlon)
+            lat_crop, lon_crop = crop_lat_lon_arrays(row_start, row_end, col_start, col_end, lat_res, lon_res, nlat)
+
+            sl = (slice(row_start, row_end + 1), slice(col_start, col_end + 1))
+            precip_raw = np.asarray(precip_node.read_array(sl), dtype=np.float32)
+            snow_raw = np.asarray(snow_node.read_array(sl), dtype=np.float32)
+
+            data = calculate_ww(precip_raw, snow_raw, dt_seconds=DT_SECONDS)
+            del precip_raw, snow_raw
+
+            if LAT_STORED_DESCENDING:
+                data = data[::-1, :]
+                lat_asc = lat_crop[::-1]
+            else:
+                lat_asc = lat_crop
+
+            render_data_merc = warp_equirect_to_webmercator(
+                data.astype(np.float32), lon_crop, lat_asc, extent, method="nearest"  # WICHTIG: nearest!
+            )
+            del data
+
+            outname = f"{var_type}_{valid_time_utc.astimezone(ZoneInfo('Europe/Berlin')):%Y%m%d_%H%M}.webp"
+            out_path = os.path.join(output_dir, outname)
+            rgba = ww_to_rgba(render_data_merc, ww_colors_base)
+            img = Image.fromarray(rgba[::-1, :, :], mode="RGBA")
+            img.save(out_path, format="WEBP", lossless=True, method=4)
+            print(f"{filename} -> {outname}")
+            return  # fertig, Rest der Funktion (generischer Pfad) ueberspringen
+
+        # ------------------------------
+        # Generischer Pfad fuer t2m/wind/tp/cape_ml
+        # ------------------------------
         try:
             var_node = root.get_child_by_name(child_name)
         except Exception as e:
