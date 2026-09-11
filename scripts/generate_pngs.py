@@ -34,8 +34,6 @@ DT_SECONDS = 900
 # Im data_spatial-Layout enthaelt JEDE Datei ALLE Variablen fuer genau
 # einen Zeitschritt (root ist eine Gruppe, kein Array). Der Dateiname
 # selbst ist der Zeitstempel, z.B. "2026-09-03T1900.om".
-# "ww" wird separat behandelt (braucht zwei Kinder), steht deshalb NICHT
-# hier drin.
 # ------------------------------
 OM_CHILD_NAMES = {
     "t2m": "temperature_2m",
