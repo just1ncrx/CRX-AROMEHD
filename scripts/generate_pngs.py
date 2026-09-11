@@ -123,7 +123,7 @@ ww_colors_base = {
 COLORMAPS = {
     "t2m": (t2m_colors, t2m_norm),
     "wind": (wind_colors, wind_norm),
-    "tp": (prec_colors, prec_norm),
+    # "tp": (prec_colors, prec_norm) #-- Nicht verfügbar!
     "cape_ml": (cape_colors, cape_norm),
 }
 
