@@ -70,7 +70,7 @@ jobs:
     needs: fetch_and_generate
     strategy:
       matrix:
-        variable: [t2m, wind, cape_ml, tp, wwhd]
+        variable: [t2m, wind, cape_ml, tp15, wwhd]
       max-parallel: 5
     steps:
       - name: Checkout Repo

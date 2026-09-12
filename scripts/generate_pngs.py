@@ -38,7 +38,7 @@ DT_SECONDS = 900
 OM_CHILD_NAMES = {
     "t2m": "temperature_2m",
     "wind": "wind_gusts_10m",
-    "tp": "precipitation",
+    "tp15": "precipitation",
     "cape_ml": "cape",
 }
 
@@ -123,7 +123,7 @@ ww_colors_base = {
 COLORMAPS = {
     "t2m": (t2m_colors, t2m_norm),
     "wind": (wind_colors, wind_norm),
-    "tp": (prec_colors, prec_norm),
+    "tp15": (prec_colors, prec_norm),
     "cape_ml": (cape_colors, cape_norm),
 }
 
